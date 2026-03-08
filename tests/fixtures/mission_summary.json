@@ -1,0 +1,63 @@
+{
+  "mission_id": "FVEX-26",
+  "drone_id": "UAS-001",
+  "total_frames": 2625,
+  "duration_seconds": 2625.0,
+  "frame_interval_s": 1.0,
+  "zone_frame_counts": {
+    "CAN_BASE": 43,
+    "TRANSIT": 2112,
+    "UK_BASE": 54,
+    "EXERCISE_CORRIDOR": 308,
+    "TARGET_AREA": 108
+  },
+  "operator_visible_frames": {
+    "alice": 2625,
+    "bob": 43,
+    "dave": 2112
+  },
+  "operator_redacted_frames": {
+    "alice": 0,
+    "bob": 2582,
+    "dave": 513
+  },
+  "operator_visibility_pct": {
+    "alice": 100.0,
+    "bob": 1.6,
+    "dave": 80.5
+  },
+  "zone_labels": {
+    "CAN_BASE": {
+      "classification": "SECRET",
+      "releasability": [
+        "CAN",
+        "FVEY"
+      ]
+    },
+    "EXERCISE_CORRIDOR": {
+      "classification": "SECRET",
+      "releasability": [
+        "FVEY"
+      ]
+    },
+    "TARGET_AREA": {
+      "classification": "SECRET",
+      "releasability": [
+        "FVEY"
+      ]
+    },
+    "TRANSIT": {
+      "classification": "PROTECTED",
+      "releasability": [
+        "FVEY"
+      ]
+    },
+    "UK_BASE": {
+      "classification": "SECRET",
+      "releasability": [
+        "GBR",
+        "FVEY"
+      ]
+    }
+  }
+}

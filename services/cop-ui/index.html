@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Iron-Veil — Drone COP</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0d1117;
+      --surface:   #161b22;
+      --border:    #30363d;
+      --text:      #e6edf3;
+      --muted:     #8b949e;
+      --green:     #3fb950;
+      --red:       #f85149;
+      --yellow:    #d29922;
+      --blue:      #58a6ff;
+
+      --zone-can:      #4488ff;
+      --zone-uk:       #ff4488;
+      --zone-corridor: #ff8800;
+      --zone-target:   #ff2222;
+      --zone-transit:  #22aa44;
+      --zone-redacted: #444;
+
+      --header-h: 52px;
+      --footer-h: 52px;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Courier New', monospace;
+      font-size: 13px;
+      height: 100vh;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── Header ── */
+    #header {
+      height: var(--header-h);
+      flex-shrink: 0;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      padding: 0 16px;
+      gap: 24px;
+    }
+    #header h1 { font-size: 1em; letter-spacing: 3px; color: var(--blue); white-space: nowrap; }
+    .op-badge {
+      display: flex; align-items: center; gap: 8px;
+      background: #0d1117; border: 1px solid var(--border);
+      border-radius: 4px; padding: 4px 12px; font-size: 0.8em;
+    }
+    .op-badge .name  { color: var(--text); font-weight: bold; }
+    .op-badge .cls   { font-weight: bold; }
+    .op-badge .rels  { color: var(--muted); }
+    .cls-SECRET    { color: var(--red); }
+    .cls-PROTECTED { color: var(--yellow); }
+    .cls-UNCLASS   { color: var(--green); }
+
+    #conn-pill {
+      padding: 3px 10px; border-radius: 10px; font-size: 0.75em;
+      border: 1px solid var(--border); color: var(--muted);
+    }
+    #conn-pill.connected    { border-color: var(--green); color: var(--green); background: #1a3a1a; }
+    #conn-pill.disconnected { border-color: var(--red);   color: var(--red);   background: #3a1a1a; }
+
+    /* ── Demo controls ── */
+    #demo-controls {
+      margin-left: auto;
+      display: flex; align-items: center; gap: 6px;
+    }
+    #demo-controls span { color: var(--muted); font-size: 0.72em; }
+    .demo-btn {
+      padding: 3px 10px; border-radius: 4px; font-size: 0.72em;
+      font-family: inherit; cursor: pointer; border: 1px solid var(--border);
+      background: var(--surface); color: var(--text); letter-spacing: 0.5px;
+    }
+    .demo-btn:hover { background: #1f2937; border-color: var(--blue); color: var(--blue); }
+    .demo-btn.active { background: #1a3a1a; border-color: var(--green); color: var(--green); }
+    #demo-btn-restart { border-color: #444; }
+    #demo-btn-restart:hover { border-color: var(--yellow); color: var(--yellow); background: #2a1f00; }
+
+    /* ── Main layout: map left | right column ── */
+    #main {
+      flex: 1;
+      display: grid;
+      grid-template-columns: 1fr 380px;
+      overflow: hidden;
+    }
+
+    /* ── Map ── */
+    #map-wrap {
+      position: relative;
+      background: #080f08;
+      border-right: 1px solid var(--border);
+    }
+    #map { display: block; width: 100%; height: 100%; }
+
+    /* ── Right column: video top, telemetry log bottom ── */
+    #right-col {
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* ── Video feed ── */
+    #video-section {
+      flex-shrink: 0;
+      background: #000;
+      border-bottom: 1px solid var(--border);
+      position: relative;
+    }
+    #video-el {
+      display: block;
+      width: 100%;
+      aspect-ratio: 16/9;
+      background: #000;
+      object-fit: contain;
+    }
+    /* Keep canvas hidden — used for legacy fallback only */
+    #video-canvas { display: none; }
+    #video-label {
+      position: absolute;
+      top: 6px; left: 8px;
+      font-size: 0.7em; letter-spacing: 1px;
+      color: var(--muted);
+    }
+    #video-cls-badge {
+      position: absolute;
+      top: 6px; right: 8px;
+      font-size: 0.7em; font-weight: bold; letter-spacing: 1px;
+      padding: 2px 6px; border-radius: 3px;
+    }
+    #video-overlay {
+      position: absolute; bottom: 0; left: 0; right: 0;
+      background: linear-gradient(transparent, rgba(0,0,0,0.7));
+      padding: 8px;
+      font-size: 0.7em; color: #ccc;
+      display: flex; gap: 16px;
+    }
+    .ov-item span { color: var(--text); }
+
+    /* Redacted video state */
+    #video-redacted {
+      display: none;
+      position: absolute; inset: 0;
+      background: #0a0a0a;
+      align-items: center; justify-content: center;
+      flex-direction: column; gap: 8px;
+    }
+    #video-redacted.visible { display: flex; }
+    #video-redacted .icon { font-size: 2em; }
+    #video-redacted .msg  { font-size: 0.75em; color: var(--muted); letter-spacing: 1px; }
+    #video-redacted .reason { font-size: 0.7em; color: var(--red); margin-top: 4px; }
+
+    /* ── Clearance card (replaces stats bar) ── */
+    #clearance-card {
+      flex-shrink: 0;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 7px 12px;
+      font-size: 0.72em;
+    }
+    #cc-operator {
+      display: flex; align-items: baseline; gap: 10px; margin-bottom: 4px;
+    }
+    #cc-name { font-size: 1.3em; font-weight: bold; letter-spacing: 1px; color: var(--text); }
+    #cc-cls-badge {
+      font-weight: bold; letter-spacing: 1px;
+      padding: 1px 7px; border-radius: 3px; font-size: 0.9em;
+    }
+    #cc-rels { color: var(--muted); }
+    #cc-status-row {
+      display: flex; align-items: center; gap: 8px; margin-top: 3px;
+    }
+    #cc-status {
+      font-weight: bold; letter-spacing: 1px; font-size: 1.05em;
+    }
+    #cc-counts { color: var(--muted); margin-left: auto; }
+    #cc-counts .cc-allow { color: var(--green); font-weight: bold; }
+    #cc-counts .cc-deny  { color: var(--red);   font-weight: bold; }
+
+    /* ── Event flash overlay (on map) ── */
+    #event-flash {
+      display: none;
+      position: absolute;
+      top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      text-align: center;
+      pointer-events: none;
+      z-index: 10;
+      animation: flash-fade 3s ease-out forwards;
+    }
+    #event-flash.visible { display: block; }
+    #event-flash .ef-title {
+      font-size: 1.4em; font-weight: bold; letter-spacing: 3px;
+      text-shadow: 0 0 20px currentColor;
+      white-space: nowrap;
+    }
+    #event-flash .ef-sub {
+      font-size: 0.75em; letter-spacing: 2px; margin-top: 6px;
+      color: #aaa; white-space: nowrap;
+    }
+    @keyframes flash-fade {
+      0%   { opacity: 0; transform: translate(-50%, -50%) scale(0.9); }
+      15%  { opacity: 1; transform: translate(-50%, -50%) scale(1.02); }
+      70%  { opacity: 1; }
+      100% { opacity: 0; }
+    }
+
+    /* ── Mission timeline bar ── */
+    #timeline-bar {
+      flex-shrink: 0;
+      background: var(--surface);
+      border-top: 1px solid var(--border);
+      padding: 5px 12px 6px;
+      font-size: 0.65em;
+    }
+    #timeline-track {
+      position: relative;
+      height: 4px;
+      background: #222;
+      border-radius: 2px;
+      margin: 10px 0 4px;
+    }
+    #timeline-fill {
+      height: 100%; border-radius: 2px;
+      background: var(--blue);
+      width: 0%;
+      transition: width 1s linear;
+    }
+    #timeline-head {
+      position: absolute;
+      top: 50%; transform: translate(-50%, -50%);
+      width: 8px; height: 8px; border-radius: 50%;
+      background: #fff;
+      left: 0%;
+      transition: left 1s linear;
+    }
+    .tl-milestone {
+      position: absolute; top: -14px;
+      transform: translateX(-50%);
+      color: var(--muted); white-space: nowrap; font-size: 0.9em;
+    }
+    .tl-tick {
+      position: absolute; top: 0; bottom: 0; width: 1px;
+      background: #333;
+    }
+    #timeline-labels {
+      display: flex; justify-content: space-between; color: var(--muted);
+    }
+
+    /* ── Telemetry log ── */
+    #telem-log {
+      flex: 1;
+      overflow-y: auto;
+      padding: 6px;
+    }
+    .telem-entry {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 6px 8px;
+      margin-bottom: 4px;
+      font-size: 0.7em;
+      cursor: default;
+    }
+    .telem-entry.allow { border-left: 3px solid var(--green); }
+    .telem-entry.deny  { border-left: 3px solid var(--red); opacity: 0.7; }
+    .telem-entry[title]:hover { background: #1f2937; border-color: #ffd700; }
+    .telem-entry .t-zone { font-weight: bold; display: flex; justify-content: space-between; }
+    .telem-entry .t-meta { color: var(--muted); margin-top: 2px; }
+    .redacted-text { color: var(--muted); font-style: italic; }
+
+    /* ── Legend (bottom of right col) ── */
+    #legend {
+      flex-shrink: 0;
+      background: var(--surface);
+      border-top: 1px solid var(--border);
+      padding: 6px 12px;
+      font-size: 0.68em;
+      display: flex; flex-wrap: wrap; gap: 6px 16px;
+    }
+    .leg { display: flex; align-items: center; gap: 5px; color: var(--muted); }
+    .leg-dot  { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+    .leg-box  { width: 10px; height: 10px; border-radius: 1px; flex-shrink: 0; border: 1px solid; background: transparent; }
+
+    /* ── Footer ── */
+    #footer {
+      height: var(--footer-h);
+      flex-shrink: 0;
+      background: var(--surface);
+      border-top: 1px solid var(--border);
+      display: flex; align-items: center;
+      padding: 0 12px; gap: 16px;
+      font-size: 0.7em; color: var(--muted);
+    }
+    #footer .mission-id { color: var(--blue); }
+    #mission-timer { color: var(--text); }
+    #timeline-bar { padding: 2px 0; }
+    #timeline-track { margin: 8px 0 3px; }
+    #timeline-labels { font-size: 0.85em; }
+  </style>
+</head>
+<body>
+
+<!-- ── Header ── -->
+<div id="header">
+  <h1>IRON-VEIL // DRONE COP</h1>
+  <div class="op-badge">
+    <span class="name" id="op-name">–</span>
+    <span class="cls"  id="op-cls">–</span>
+    <span class="rels" id="op-rels">–</span>
+  </div>
+  <div id="conn-pill" class="disconnected">Connecting…</div>
+  <div id="demo-controls">
+    <span>SPEED</span>
+    <button class="demo-btn" id="demo-btn-slow"   onclick="demoSpeed(2.0)">0.5×</button>
+    <button class="demo-btn active" id="demo-btn-normal" onclick="demoSpeed(1.0)">1×</button>
+    <button class="demo-btn" id="demo-btn-fast"   onclick="demoSpeed(0.5)">2×</button>
+    <button class="demo-btn" id="demo-btn-faster" onclick="demoSpeed(0.25)">4×</button>
+    <button class="demo-btn" id="demo-btn-restart" onclick="demoRestart()">↺ RESTART</button>
+  </div>
+</div>
+
+<!-- ── Main ── -->
+<div id="main">
+
+  <!-- Left: map -->
+  <div id="map-wrap">
+    <canvas id="map"></canvas>
+    <!-- Event flash overlay — zone transition / access callout -->
+    <div id="event-flash">
+      <div class="ef-title" id="ef-title"></div>
+      <div class="ef-sub"   id="ef-sub"></div>
+    </div>
+  </div>
+
+  <!-- Right column -->
+  <div id="right-col">
+
+    <!-- Video feed -->
+    <div id="video-section">
+      <!-- Real MPEG-TS playback via mpegts.js (MediaSource Extensions) -->
+      <video id="video-el" autoplay muted playsinline></video>
+      <!-- Legacy synthetic canvas (hidden, fallback only) -->
+      <canvas id="video-canvas"></canvas>
+      <div id="video-label">DRONE FEED // EO/IR · STANAG 4609</div>
+      <div id="video-cls-badge"></div>
+      <div id="video-overlay">
+        <div class="ov-item">LAT <span id="ov-lat">–</span></div>
+        <div class="ov-item">LON <span id="ov-lon">–</span></div>
+        <div class="ov-item">ALT <span id="ov-alt">–</span> m</div>
+        <div class="ov-item">HDG <span id="ov-hdg">–</span>°</div>
+        <div class="ov-item">SPD <span id="ov-spd">–</span> m/s</div>
+      </div>
+      <!-- Redacted overlay -->
+      <div id="video-redacted">
+        <div class="icon">🔒</div>
+        <div class="msg">VIDEO FEED REDACTED</div>
+        <div class="reason" id="redact-reason">–</div>
+      </div>
+    </div>
+
+    <!-- Clearance card -->
+    <div id="clearance-card">
+      <div id="cc-operator">
+        <span id="cc-name">–</span>
+        <span id="cc-cls-badge">–</span>
+        <span id="cc-rels">–</span>
+      </div>
+      <div id="cc-status-row">
+        <span id="cc-status">AWAITING DATA</span>
+        <span id="cc-counts">
+          <span class="cc-allow" id="cc-allow">0</span> authorized &nbsp;
+          <span class="cc-deny"  id="cc-deny">0</span> denied
+        </span>
+      </div>
+    </div>
+
+    <!-- Telemetry log -->
+    <div id="telem-log"></div>
+
+    <!-- Legend -->
+    <div id="legend">
+      <div class="leg"><div class="leg-dot" style="background:var(--zone-can)"></div>CAN Base</div>
+      <div class="leg"><div class="leg-dot" style="background:var(--zone-uk)"></div>UK Base</div>
+      <div class="leg"><div class="leg-box" style="border-color:var(--zone-corridor)"></div>Exercise Corridor</div>
+      <div class="leg"><div class="leg-dot" style="background:var(--zone-target)"></div>Target</div>
+      <div class="leg"><div class="leg-dot" style="background:var(--zone-transit)"></div>Transit (PROTECTED)</div>
+      <div class="leg" style="border-left:2px solid var(--red);padding-left:4px">Track: SECRET</div>
+      <div class="leg" style="border-left:2px solid var(--yellow);padding-left:4px">Track: PROTECTED</div>
+      <div class="leg"><div class="leg-box" style="border-color:var(--red);border-style:dashed"></div>Denied</div>
+    </div>
+
+  </div><!-- /right-col -->
+</div><!-- /main -->
+
+<!-- ── Footer / Timeline ── -->
+<div id="footer">
+  <span>MISSION <span class="mission-id" id="f-mission">FVEX-26</span></span>
+  <span>DRONE <span class="mission-id" id="f-drone">UAS-001</span></span>
+  <span>T+ <span id="mission-timer">0s</span></span>
+  <div id="timeline-bar" style="flex:1;margin-left:16px">
+    <div id="timeline-track">
+      <div id="timeline-fill"></div>
+      <div id="timeline-head"></div>
+      <!-- milestones injected by JS -->
+    </div>
+    <div id="timeline-labels">
+      <span>T+0</span>
+      <span>UK BASE T+68s</span>
+      <span>TARGET T+170s</span>
+      <span>TRANSIT T+185s</span>
+      <span>RTB T+373s</span>
+    </div>
+  </div>
+  <span style="margin-left:16px;white-space:nowrap">ACP-240 DCS // STANAG 4609</span>
+</div>
+
+<!-- mpegts.js — MPEG-TS playback in browser via MediaSource Extensions -->
+<!-- Using the self-hosted dist version bundled into cop-ui/ -->
+<script src="mpegts.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

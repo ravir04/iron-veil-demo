@@ -1,0 +1,4 @@
+cryptography>=42.0.0
+jcs>=0.2.1
+requests>=2.31.0
+Pillow>=10.0.0

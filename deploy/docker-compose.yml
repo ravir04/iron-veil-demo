@@ -1,0 +1,101 @@
+# Iron-Veil Demo — Drone COP
+#
+# Prerequisites (start in order):
+#   1. cd ../signet/deploy && docker compose up -d --build
+#   2. cd ../iron-veil/deploy && docker compose up -d --build
+#   3. cd iron-veil-demo/deploy && docker compose up -d --build
+#
+# Services added by this stack:
+#   drone-sim  (internal) — STANAG 4609 KLV producer → Signet /signet/bulk-ingest
+#   cop-ui     (:8090)    — Browser COP display → Signet SSE + unwrap direct
+#   minio      (:9000/:9001) — Local S3-compatible data lake (dev only)
+#
+# Network topology:
+#   Joins signet_default so drone-sim can POST to http://signet:4774/signet/bulk-ingest.
+#   cop-ui is browser-side — it calls Signet directly on localhost:4774.
+#
+# Data lake (SIG-009):
+#   Signet mirrors ciphertext + manifest to the configured S3 bucket on each ingest.
+#   Plaintext never leaves the KAS. Keys remain in Signet.
+#   For dev, MinIO is provided. For production, set DATA_LAKE_S3_* to your real endpoint.
+
+name: iron-veil-demo
+
+networks:
+  default:
+    driver: bridge
+  signet:
+    external: true
+    name: signet_default
+
+services:
+  drone-sim:
+    build: ../services/drone-sim
+    networks:
+      - default
+      - signet
+    ports:
+      - "8092:8092"   # Demo control sidecar (also proxied via cop-ui nginx at /demo/)
+    environment:
+      SIGNET_BULK_INGEST_URL: http://signet:4774/signet/bulk-ingest
+      KAS_URL: http://signet:4774
+      PYTHONUNBUFFERED: "1"
+      ISSUER_PRIVATE_KEY_PATH: /config/trust/issuer_private.pem
+      KAS_PUBLIC_KEY_PATH: /config/trust/kas_public.pem
+      ISSUER_ID: node-issuer
+      FRAME_INTERVAL: "1.0"
+      BULK_SIZE: "5"
+      MISSION_ID: "FVEX-26"
+      DRONE_ID: "UAS-001"
+      # MPEG-TS segment duration. Shorter = lower latency. Demo=2.0, Prod=0.5–4.0
+      SEGMENT_DURATION_S: "2.0"
+      # Set to "false" to skip FFmpeg (KLV-only, no video codec)
+      VIDEO_ENABLED: "true"
+      # Path to a real aerial footage file to loop (MP4/MKV/etc).
+      # Leave unset to use synthetic lavfi frames instead.
+      VIDEO_SOURCE_PATH: "/footage/aerial.mp4"
+    volumes:
+      # Trust material lives in the Signet deploy config
+      - ../../signet/deploy/config:/config:ro
+      # Mount the test fixtures directory so aerial.mp4 is accessible in container
+      - ../tests/fixtures:/footage:ro
+    restart: unless-stopped
+
+  cop-ui:
+    image: nginx:alpine
+    networks:
+      - default
+      - signet
+    ports:
+      - "8090:80"
+    volumes:
+      - ../services/cop-ui:/usr/share/nginx/html:ro
+      - ./config/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - drone-sim
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # MinIO — local S3-compatible data lake (dev only)
+  # Production: remove this service and point DATA_LAKE_S3_* at your real S3.
+  # ---------------------------------------------------------------------------
+  minio:
+    image: minio/minio:latest
+    profiles: [datalake]
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # MinIO web console
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  miniodata:
