@@ -168,18 +168,19 @@ class MissionWaypoint:
 #   - Alice sees the entire track throughout
 STANDARD_MISSION: list[MissionWaypoint] = [
     MissionWaypoint(CAN_BASE,    "TAKEOFF",     altitude_m=0.0,   speed_ms=0.0),
-    # Demo-speed: 300 m/s gives ~370s total mission (6 min at 1×, ~90s at 4×).
+    # Demo-speed: 366 m/s gives ~300s total mission (5 min at 1×, ~75s at 4×).
+    # Total cruise distance ≈ 109.9 km; 109900 / 300 ≈ 366 m/s.
     # The speed is synthetic — actual KLV metadata carries it but it's not displayed.
-    # Zone transitions at: T+5s (exit CAN), T+68s (UK_BASE), T+75s (CORRIDOR),
-    #   T+106s (TRANSIT), T+170s (TARGET), T+185s (Dave's first frame), T+368s (RTB CAN)
-    MissionWaypoint(CAN_BASE,    "CLIMB",       altitude_m=500.0, speed_ms=300.0),
-    MissionWaypoint(UK_BASE,     "CRUISE",      altitude_m=500.0, speed_ms=300.0),
-    MissionWaypoint(TARGET,      "APPROACH",    altitude_m=300.0, speed_ms=300.0),
+    # Zone transitions at: T+4s (exit CAN), T+56s (UK_BASE), T+62s (CORRIDOR),
+    #   T+87s (TRANSIT), T+139s (TARGET), T+152s (Dave's first frame), T+300s (RTB CAN)
+    MissionWaypoint(CAN_BASE,    "CLIMB",       altitude_m=500.0, speed_ms=366.0),
+    MissionWaypoint(UK_BASE,     "CRUISE",      altitude_m=500.0, speed_ms=366.0),
+    MissionWaypoint(TARGET,      "APPROACH",    altitude_m=300.0, speed_ms=366.0),
     MissionWaypoint(TARGET,      "LOITER_1",    altitude_m=300.0, speed_ms=100.0),
     MissionWaypoint(TARGET,      "LOITER_2",    altitude_m=300.0, speed_ms=100.0),
     # Return leg swings north through TRANSIT airspace — Dave's first visibility
-    MissionWaypoint(TRANSIT_RTB, "RTB_TRANSIT", altitude_m=500.0, speed_ms=300.0),
-    MissionWaypoint(CAN_BASE,    "RTB_FINAL",   altitude_m=500.0, speed_ms=300.0),
+    MissionWaypoint(TRANSIT_RTB, "RTB_TRANSIT", altitude_m=500.0, speed_ms=366.0),
+    MissionWaypoint(CAN_BASE,    "RTB_FINAL",   altitude_m=500.0, speed_ms=366.0),
     MissionWaypoint(CAN_BASE,    "LANDING",     altitude_m=0.0,   speed_ms=0.0),
 ]
 

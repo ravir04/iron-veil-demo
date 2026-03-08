@@ -35,7 +35,7 @@ function _resetMissionState() {
   cntTotal = cntAllow = cntDeny = 0;
   _lastZone = null;
   _lastAllowed = null;
-  _droneFrom = null; _droneTo = null; _animId = null;
+  _dronePosQueue.length = 0; _droneFrom = null; _droneTo = null; _animId = null;
   _sseQueue.length = 0; _sseRunning = false;
   clearTimeout(_zoneDebounceTimer); _pendingZone = null;
   updateTimeline(0);
@@ -122,31 +122,50 @@ let focusPoint   = null;   // { lat, lon } — set by clicking a telemetry entry
 // ---------------------------------------------------------------------------
 // Drone position interpolation
 //
-// Rather than snapping the drone icon to each telemetry tick, we lerp smoothly
-// between the previous and current position at 60fps. This eliminates the
-// jerky appearance caused by bulk-ingest bursts and 1s frame intervals.
+// Drone position interpolation — sequential waypoint queue
+//
+// Telemetry frames often arrive in bursts (bulk-ingest at 4× speed delivers
+// 4 frames nearly simultaneously). Rather than lerping only between the last
+// two positions, we queue every received position and animate through them
+// one-by-one, each over `intervalMs`. This gives continuous smooth motion
+// regardless of burst delivery.
 // ---------------------------------------------------------------------------
-let _droneFrom     = null;  // { lat, lon } — position at start of lerp
-let _droneTo       = null;  // { lat, lon } — position at end of lerp
-let _lerpStart     = 0;     // Date.now() when lerp began
-let _lerpDuration  = 1000;  // ms — matches frame interval
-let _animId        = null;  // rAF handle
+const _dronePosQueue = [];   // { lat, lon, intervalMs, onArrive }
+let   _droneFrom     = null; // current lerp start position
+let   _droneTo       = null; // current lerp end position (also holds onArrive cb)
+let   _lerpStart     = 0;
+let   _lerpDuration  = 1000;
+let   _animId        = null;
+
+function _advanceDroneQueue() {
+  // Fire the arrival callback for the waypoint we just finished lerping to
+  if (_droneTo?.onArrive) _droneTo.onArrive(_droneTo.lat, _droneTo.lon);
+  if (_dronePosQueue.length === 0) { _droneTo = null; return; }
+  const next   = _dronePosQueue.shift();
+  _droneFrom   = _droneTo ? { lat: _droneTo.lat, lon: _droneTo.lon } : { lat: next.lat, lon: next.lon };
+  _droneTo     = next;
+  _lerpStart   = Date.now();
+  _lerpDuration = next.intervalMs || 1000;
+}
 
 function _startDroneAnim() {
   if (_animId) return;
   function frame() {
-    if (!_droneTo) { _animId = null; return; }
+    if (!_droneTo && _dronePosQueue.length === 0) { _animId = null; return; }
+    // Advance to next waypoint when current lerp completes
+    if (_droneTo && Date.now() - _lerpStart >= _lerpDuration) {
+      _advanceDroneQueue();
+    }
     renderMap();
     _animId = requestAnimationFrame(frame);
   }
   _animId = requestAnimationFrame(frame);
 }
 
-function _updateDroneTarget(lat, lon, intervalMs) {
-  _droneFrom    = _droneTo ? { ..._droneTo } : { lat, lon };
-  _droneTo      = { lat, lon };
-  _lerpStart    = Date.now();
-  _lerpDuration = intervalMs || 1000;
+function _updateDroneTarget(lat, lon, intervalMs, onArrive) {
+  _dronePosQueue.push({ lat, lon, intervalMs: intervalMs || 1000, onArrive });
+  // If nothing is animating yet, kick off immediately
+  if (!_droneTo) _advanceDroneQueue();
   _startDroneAnim();
 }
 
@@ -155,8 +174,7 @@ function _interpolatedDronePos() {
   if (!_droneTo) return null;
   if (!_droneFrom) return _droneTo;
   const t = Math.min((Date.now() - _lerpStart) / _lerpDuration, 1.0);
-  // Ease-out: feels more natural for a moving vehicle
-  const e = 1 - Math.pow(1 - t, 2);
+  const e = 1 - Math.pow(1 - t, 2); // ease-out
   return {
     lat: _droneFrom.lat + (_droneTo.lat - _droneFrom.lat) * e,
     lon: _droneFrom.lon + (_droneTo.lon - _droneFrom.lon) * e,
@@ -265,127 +283,70 @@ async function fetchObjectMeta(objectId, ingestTs) {
 // ---------------------------------------------------------------------------
 // Signet: continuous FMV stream (SIG-010) — long-lived MPEG-TS over HTTP
 //
-// Opens a single chunked connection to /signet/stream/fmv/{mission}/{drone}.
-// Reads the response body as a ReadableStream and pushes chunks directly into
-// the MSE SourceBuffer as they arrive. Signet gates each GOP by policy; denied
-// GOPs are simply absent from the stream (the SSE channel signals the gap).
-//
-// Returns a controller object with .abort() to close the stream.
 // ---------------------------------------------------------------------------
-function connectFMVStream(missionId, droneId) {
-  const headers = jwt ? { Authorization: `Bearer ${jwt}` } : {};
-  const url = `${SIGNET_URL}/signet/stream/fmv/${encodeURIComponent(missionId)}/${encodeURIComponent(droneId)}`;
-  const controller = new AbortController();
-
-  (async () => {
-    let backoff = 1000;
-    while (!controller.signal.aborted) {
-      try {
-        const r = await fetch(url, { headers, signal: controller.signal });
-        if (!r.ok || !r.body) {
-          await new Promise(res => setTimeout(res, backoff));
-          backoff = Math.min(backoff * 2, 30000);
-          continue;
-        }
-        backoff = 1000;
-        const reader = r.body.getReader();
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (value && value.byteLength > 0) feedSegment(value.buffer);
-        }
-      } catch (e) {
-        if (controller.signal.aborted) break;
-        await new Promise(res => setTimeout(res, backoff));
-        backoff = Math.min(backoff * 2, 30000);
-      }
-    }
-  })();
-
-  return controller;
-}
-
-// ---------------------------------------------------------------------------
-// MPEG-TS player — MSE SourceBuffer fed with segments from Signet SIG-006
+// MPEG-TS player — mpegts.js handles TS demux → fMP4 remux → MSE.
 //
-// We push ArrayBuffer segments directly into the MSE SourceBuffer as they
-// arrive from Signet. mpegts.js is used for MIME type negotiation and
-// browser compatibility detection; actual demuxing is handled by the
-// native browser MSE pipeline (H.264 in video/mp2t).
+// Chrome/Edge do not support video/mp2t natively in MSE. mpegts.js demuxes
+// the MPEG-TS stream and remuxes it into fragmented MP4 before feeding the
+// SourceBuffer, which all browsers support.
 //
-// Segment queue ensures we never call appendBuffer while the SourceBuffer
-// is still processing a previous segment (updating === true).
+// connectFMVStream() creates/destroys the mpegts.js player instance.
+// showVideoRedacted() detaches it; hideVideoRedacted() reattaches.
 // ---------------------------------------------------------------------------
-const videoEl   = document.getElementById('video-el');
-const _segQueue = [];
-let   _sourceBuffer = null;
-let   _mseReady     = false;
+const videoEl = document.getElementById('video-el');
+let _mpegtsPlayer = null;
+let _fmvUrl       = null;
 
-function initPlayer() {
-  if (!('MediaSource' in window)) {
-    console.warn('[cop-ui] MediaSource API not available');
-    return;
+function _buildMpegtsPlayer(url) {
+  if (!window.mpegts || !mpegts.isSupported()) {
+    console.warn('[cop-ui] mpegts.js not available or MSE not supported');
+    return null;
   }
-
-  // Check mpegts.js loaded (optional — used for feature detection)
-  if (window.mpegts && !mpegts.isSupported()) {
-    console.warn('[cop-ui] mpegts.js reports MSE not supported');
-  }
-
-  const ms = new MediaSource();
-  videoEl.src = URL.createObjectURL(ms);
-
-  ms.addEventListener('sourceopen', () => {
-    try {
-      // IANA MIME for MPEG-TS; H.264 baseline (avc1.42E01E = profile 66, level 30)
-      _sourceBuffer = ms.addSourceBuffer('video/mp2t; codecs="avc1.42E01E"');
-    } catch {
-      // Fallback: try without explicit codec
-      try { _sourceBuffer = ms.addSourceBuffer('video/mp2t'); } catch {}
+  const player = mpegts.createPlayer(
+    { type: 'mpegts', url, isLive: true, hasAudio: false, hasVideo: true },
+    {
+      enableWorker: true,
+      lazyLoad: false,
+      liveBufferLatencyChasing: true,
+      liveBufferLatencyMaxLatency: 3.0,
+      liveBufferLatencyMinRemain: 0.5,
     }
-    if (!_sourceBuffer) return;
-
-    // Set mode once — never touch it again after this point.
-    try { _sourceBuffer.mode = 'sequence'; } catch {}
-    _sourceBuffer.addEventListener('updateend', _drainQueue);
-    _mseReady = true;
-    _drainQueue();
+  );
+  player.on(mpegts.Events.ERROR, (errType, errDetail) => {
+    console.warn('[cop-ui] mpegts error:', errType, errDetail);
   });
-
-  ms.addEventListener('sourceclose', () => { _mseReady = false; });
-  ms.addEventListener('sourceended', () => { _mseReady = false; });
+  player.attachMediaElement(videoEl);
+  player.load();
+  videoEl.play().catch(() => {});
+  return player;
 }
 
-function _drainQueue() {
-  if (!_mseReady || !_sourceBuffer || _sourceBuffer.updating || _segQueue.length === 0) return;
-  const seg = _segQueue.shift();
-  try {
-    _sourceBuffer.appendBuffer(seg);
-  } catch (e) {
-    // QuotaExceededError: evict old buffered data and retry
-    if (e.name === 'QuotaExceededError' && _sourceBuffer.buffered.length > 0) {
-      const end   = _sourceBuffer.buffered.end(0);
-      const start = _sourceBuffer.buffered.start(0);
-      if (end - start > 30) {
-        _sourceBuffer.remove(start, end - 30);
-        _segQueue.unshift(seg);
-        return;
-      }
-    }
-    // Any other error (InvalidStateError etc): discard segment and log once
-    if (e.name !== 'InvalidStateError') console.warn('[cop-ui] appendBuffer error:', e.name);
-  }
+function connectFMVStream(missionId, droneId) {
+  // Use the /fmv/ nginx proxy which injects Authorization from ?token=.
+  // mpegts.js runs in a Web Worker (WorkerGlobalScope) where:
+  //   - relative URLs fail (resolved against blob: worker URL, not page origin)
+  //   - custom request headers cannot be passed from the main thread
+  // The /fmv/ proxy solves both: absolute URL, token injected server-side by nginx.
+  const token = jwt ? `?token=${encodeURIComponent(jwt)}` : '';
+  _fmvUrl = `${window.location.origin}/fmv/${encodeURIComponent(missionId)}/${encodeURIComponent(droneId)}${token}`;
+  // Player is started by hideVideoRedacted() once policy allows it.
 }
 
-function feedSegment(arrayBuffer) {
-  if (!_sourceBuffer) return;
-  if (!_videoAllowed) return;  // policy gate — don't buffer or play while redacted
-  _segQueue.push(arrayBuffer);
-  _drainQueue();
-  if (videoEl.paused && videoEl.readyState >= 2) {
-    videoEl.play().catch(() => {});
-  }
+function _startFMVPlayer() {
+  if (_mpegtsPlayer) return;
+  if (!_fmvUrl) return;
+  _mpegtsPlayer = _buildMpegtsPlayer(_fmvUrl);
 }
+
+function _stopFMVPlayer() {
+  if (!_mpegtsPlayer) return;
+  try { _mpegtsPlayer.pause(); _mpegtsPlayer.unload(); _mpegtsPlayer.detachMediaElement(); _mpegtsPlayer.destroy(); } catch {}
+  _mpegtsPlayer = null;
+}
+
+// Stubs kept so rest of code compiles — no longer used but harmless.
+function initPlayer() {}
+function feedSegment() {}
 
 // ---------------------------------------------------------------------------
 // Video overlay HUD
@@ -405,24 +366,13 @@ function updateVideoOverlay(meta) {
   badge.style.border     = `1px solid ${badge.style.color}`;
 }
 
-let _videoAllowed = false;  // gate: feedSegment will not play() unless true
+let _videoAllowed = false;
 
 function showVideoRedacted(reason) {
+  if (!_videoAllowed && document.getElementById('video-redacted').classList.contains('visible')) return;
   _videoAllowed = false;
-  videoEl.pause();
-  _segQueue.length = 0;  // discard pending segments
-
-  // Flush the MSE SourceBuffer so decoded frames don't keep playing under the overlay
-  if (_sourceBuffer && !_sourceBuffer.updating && _mseReady) {
-    try {
-      if (_sourceBuffer.buffered.length > 0) {
-        const start = _sourceBuffer.buffered.start(0);
-        const end   = _sourceBuffer.buffered.end(_sourceBuffer.buffered.length - 1);
-        _sourceBuffer.remove(start, end + 0.1);
-      }
-    } catch {}
-  }
-
+  // Stop the mpegts.js player so video stops and no frames bleed through the overlay
+  _stopFMVPlayer();
   document.getElementById('video-redacted').classList.add('visible');
   document.getElementById('redact-reason').textContent = reason || 'ACCESS DENIED';
   const badge = document.getElementById('video-cls-badge');
@@ -432,12 +382,11 @@ function showVideoRedacted(reason) {
 }
 
 function hideVideoRedacted() {
+  if (_videoAllowed) return;
   _videoAllowed = true;
   document.getElementById('video-redacted').classList.remove('visible');
-  // Resume playback — next feedSegment() call will restart it
-  if (videoEl.paused && videoEl.readyState >= 2) {
-    videoEl.play().catch(() => {});
-  }
+  // Start (or restart) the mpegts.js player now that policy allows it
+  _startFMVPlayer();
 }
 
 // ---------------------------------------------------------------------------
@@ -957,23 +906,23 @@ function updateClearanceCard(zone, allowed, reason) {
 // ---------------------------------------------------------------------------
 // Mission timeline bar
 // ---------------------------------------------------------------------------
-// Milestones from measured mission path at 300 m/s (total ~370s).
+// Milestones from measured mission path at 366 m/s (total ~300s = 5 min at 1×).
 // Fractions = mission_time_s / MISSION_DURATION_S.
-//   T+5   exit CAN_BASE → TRANSIT
-//   T+68  reach UK_BASE
-//   T+75  EXERCISE_CORRIDOR
-//   T+106 exit corridor → TRANSIT
-//   T+170 TARGET_AREA
-//   T+185 exit TARGET → TRANSIT (Dave's first frame)
-//   T+368 return to CAN_BASE (Bob reappears)
+//   T+4   exit CAN_BASE → TRANSIT
+//   T+56  reach UK_BASE
+//   T+62  EXERCISE_CORRIDOR
+//   T+87  exit corridor → TRANSIT
+//   T+139 TARGET_AREA
+//   T+152 exit TARGET → TRANSIT (Dave's first frame)
+//   T+300 return to CAN_BASE (Bob reappears)
 const TIMELINE_MILESTONES = [
   { label: 'TAKEOFF',  frac: 0.00 },
-  { label: 'UK BASE',  frac: 0.18 },   // T+68s
-  { label: 'TARGET',   frac: 0.46 },   // T+170s
-  { label: 'TRANSIT',  frac: 0.50 },   // T+185s  — Dave appears
-  { label: 'RTB',      frac: 1.00 },   // T+373s
+  { label: 'UK BASE',  frac: 0.19 },   // T+56s
+  { label: 'TARGET',   frac: 0.46 },   // T+139s
+  { label: 'TRANSIT',  frac: 0.51 },   // T+152s  — Dave appears
+  { label: 'RTB',      frac: 1.00 },   // T+300s
 ];
-const MISSION_DURATION_S = 373;
+const MISSION_DURATION_S = 300;
 
 function updateTimeline(missionTimeS) {
   const frac = Math.min(missionTimeS / MISSION_DURATION_S, 1.0);
@@ -1069,6 +1018,7 @@ function connectSSE(onMessage) {
         const reader  = r.body.getReader();
         const decoder = new TextDecoder();
         let   buf     = '';
+        let   evtType = 'message';
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
@@ -1076,8 +1026,13 @@ function connectSSE(onMessage) {
           const lines = buf.split('\n');
           buf = lines.pop(); // keep incomplete last line
           for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              try { onMessage({ data: line.slice(6) }); } catch {}
+            if (line.startsWith('event: ')) {
+              evtType = line.slice(7).trim();
+            } else if (line.startsWith('data: ')) {
+              try { onMessage({ type: evtType, data: line.slice(6) }); } catch {}
+              evtType = 'message'; // reset after data line
+            } else if (line === '') {
+              evtType = 'message'; // blank line = end of event block
             }
           }
         }
@@ -1141,10 +1096,24 @@ async function start() {
 
 async function _processSseFrame(event) {
     const notification = JSON.parse(event.data);
+    const evtType = event.type || 'message';
+
+    // STR-005: zone_transition events — emitted by Signet on every zone crossing.
+    // Use these for accurate audit trail instead of inferring from telemetry frames.
+    if (evtType === 'zone_transition') {
+      const { drone_id, from_zone, to_zone, lat, lon } = notification;
+      if (drone_id !== DRONE_ID) return;
+      const allowed = canAccessLocally({ classification: 'PROTECTED', releasability: ['FVEY'] });
+      _debounceZoneTransition(to_zone, allowed, null);
+      addTelemEntry({ zone: to_zone, classification: '—', releasability: [], lat, lon,
+                      metadata: { zone: to_zone, lat, lon, from_zone } }, allowed, null);
+      renderMap();
+      return;
+    }
 
     // Skip secondary FMV redaction events (fmv_redacted, fmv_allowed) — these
     // have no ingest_ts/labels and are not new objects to process.
-    if (notification.event) return;
+    if (notification.event || (evtType !== 'message' && evtType !== 'object')) return;
 
     const { object_id, labels, ingest_ts } = notification;
 
@@ -1176,11 +1145,14 @@ async function _processSseFrame(event) {
     if (localAllowed) {
       cntAllow++;
       if (lat != null && lon != null) {
-        trackPoints.push({ lat, lon, zone, cls, allowed: true, ts: notification.ingest_ts });
-        // Start smooth interpolation to new position.
-        // Duration matches the frame interval so the drone arrives exactly as the next frame fires.
-        const intervalMs = (_demoInterval || 1.0) * 1000;
-        _updateDroneTarget(lat, lon, intervalMs);
+        // STR-002: use frame_interval_ms from SSE payload if present (avoids 1s polling lag).
+        // Fall back to _demoInterval from /demo/status poll.
+        const intervalMs = notification.frame_interval_ms || (_demoInterval || 1.0) * 1000;
+        // Plot track point only when the icon arrives at the position, so the dot
+        // stays under the icon rather than jumping one frame ahead.
+        _updateDroneTarget(lat, lon, intervalMs, (aLat, aLon) => {
+          trackPoints.push({ lat: aLat, lon: aLon, zone, cls, allowed: true, ts: notification.ingest_ts });
+        });
       }
       updateVideoOverlay(enriched);
       addTelemEntry(enriched, true, null);

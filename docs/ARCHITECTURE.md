@@ -146,3 +146,28 @@ The drone-sim applies STANAG 5636 OCL labels based on the current geofence zone:
 | cop-ui | **8090** | Browser-based COP display |
 | Iron-Veil matrix-proxy | 8009 | Matrix chat (existing demo) |
 | Catalog-API | 8082 | Object manifest (existing demo) |
+
+---
+
+## Production FMV Architecture
+
+The demo uses one ZTDF envelope per telemetry frame (1/s) with SSE-driven map updates. Production FMV replaces this with three dedicated channels:
+
+```
+  SIG-010 push stream  →  continuous MPEG-TS video, GOP-gated by OPA
+  STR-003 klv_telemetry SSE  →  lat/lon/alt at GOP rate, drives map icon
+  SIG-003 zone_transition SSE  →  fires only on zone crossings, drives clearance UI
+```
+
+Key differences from the demo:
+
+| | Demo | Production |
+|---|---|---|
+| Wrap granularity | 1 envelope / KLV frame (1/s) | 1 envelope / GOP (1–2 s of video) |
+| SSE load | 1 event/s/drone | ~0 zone events + 1 telemetry/s/drone |
+| Multi-drone | 1 drone, 1 SSE conn | N drones, 1 SSE conn (events tagged by drone_id) |
+| Video latency | ~1–2 s | ~0.5–1 s (shorter GOP) |
+
+A single SIG-003 SSE connection handles all drones. Each `zone_transition` event carries `drone_id`, so the COP-UI can maintain per-drone clearance cards and map tracks over one shared connection regardless of drone count.
+
+See **[docs/PRODUCTION-SCALE.md](PRODUCTION-SCALE.md)** for full throughput analysis, crypto cost breakdown, multi-drone fan-out numbers, and drone-sim configuration for higher-throughput testing.

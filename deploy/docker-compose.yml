@@ -43,12 +43,17 @@ services:
       ISSUER_PRIVATE_KEY_PATH: /config/trust/issuer_private.pem
       KAS_PUBLIC_KEY_PATH: /config/trust/kas_public.pem
       ISSUER_ID: node-issuer
+      # Frame interval in seconds. 1.0 = 1 fps (demo). 0.5 = 2 fps. 0.25 = 4 fps.
+      # Use /demo/speed/{interval} at runtime to change without restarting.
       FRAME_INTERVAL: "1.0"
-      BULK_SIZE: "5"
+      # BULK_SIZE: how many envelopes to batch per POST /signet/bulk-ingest.
+      # 1 = lowest latency. N_DRONES = most efficient for multi-drone production.
+      BULK_SIZE: "1"
       MISSION_ID: "FVEX-26"
       DRONE_ID: "UAS-001"
-      # MPEG-TS segment duration. Shorter = lower latency. Demo=2.0, Prod=0.5–4.0
-      SEGMENT_DURATION_S: "2.0"
+      # MPEG-TS segment duration. Shorter = lower latency. Demo=1.0, Prod=0.5–4.0
+      # Set equal to FRAME_INTERVAL for GOP-aligned production mode.
+      SEGMENT_DURATION_S: "1.0"
       # Set to "false" to skip FFmpeg (KLV-only, no video codec)
       VIDEO_ENABLED: "true"
       # Path to a real aerial footage file to loop (MP4/MKV/etc).
