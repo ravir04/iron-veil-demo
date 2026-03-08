@@ -35,6 +35,9 @@ function _resetMissionState() {
   cntTotal = cntAllow = cntDeny = 0;
   _lastZone = null;
   _lastAllowed = null;
+  _droneFrom = null; _droneTo = null; _animId = null;
+  _sseQueue.length = 0; _sseRunning = false;
+  clearTimeout(_zoneDebounceTimer); _pendingZone = null;
   updateTimeline(0);
   document.getElementById('cc-allow').textContent = '0';
   document.getElementById('cc-deny').textContent  = '0';
@@ -115,6 +118,94 @@ let seenIds      = new Set();  // deduplicate backfill vs SSE
 let cntTotal = 0, cntAllow = 0, cntDeny = 0;
 let missionStart = null;
 let focusPoint   = null;   // { lat, lon } — set by clicking a telemetry entry
+
+// ---------------------------------------------------------------------------
+// Drone position interpolation
+//
+// Rather than snapping the drone icon to each telemetry tick, we lerp smoothly
+// between the previous and current position at 60fps. This eliminates the
+// jerky appearance caused by bulk-ingest bursts and 1s frame intervals.
+// ---------------------------------------------------------------------------
+let _droneFrom     = null;  // { lat, lon } — position at start of lerp
+let _droneTo       = null;  // { lat, lon } — position at end of lerp
+let _lerpStart     = 0;     // Date.now() when lerp began
+let _lerpDuration  = 1000;  // ms — matches frame interval
+let _animId        = null;  // rAF handle
+
+function _startDroneAnim() {
+  if (_animId) return;
+  function frame() {
+    if (!_droneTo) { _animId = null; return; }
+    renderMap();
+    _animId = requestAnimationFrame(frame);
+  }
+  _animId = requestAnimationFrame(frame);
+}
+
+function _updateDroneTarget(lat, lon, intervalMs) {
+  _droneFrom    = _droneTo ? { ..._droneTo } : { lat, lon };
+  _droneTo      = { lat, lon };
+  _lerpStart    = Date.now();
+  _lerpDuration = intervalMs || 1000;
+  _startDroneAnim();
+}
+
+// Returns the current interpolated drone position (null if no data yet).
+function _interpolatedDronePos() {
+  if (!_droneTo) return null;
+  if (!_droneFrom) return _droneTo;
+  const t = Math.min((Date.now() - _lerpStart) / _lerpDuration, 1.0);
+  // Ease-out: feels more natural for a moving vehicle
+  const e = 1 - Math.pow(1 - t, 2);
+  return {
+    lat: _droneFrom.lat + (_droneTo.lat - _droneFrom.lat) * e,
+    lon: _droneFrom.lon + (_droneTo.lon - _droneFrom.lon) * e,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// SSE frame queue — serialize async frame processing
+//
+// The SSE handler is async (calls fetchObjectMeta). Without a queue, multiple
+// frames that arrive in a burst (e.g. from bulk-ingest) are processed
+// concurrently and can interleave, causing out-of-order track points and
+// flickering overlay state. The queue ensures frames are processed one at a
+// time in arrival order.
+// ---------------------------------------------------------------------------
+const _sseQueue   = [];
+let   _sseRunning = false;
+
+async function _enqueueSseFrame(handler, event) {
+  _sseQueue.push({ handler, event });
+  if (_sseRunning) return;
+  _sseRunning = true;
+  while (_sseQueue.length > 0) {
+    const { handler: h, event: e } = _sseQueue.shift();
+    await h(e);
+  }
+  _sseRunning = false;
+}
+
+// ---------------------------------------------------------------------------
+// Zone transition debouncing
+//
+// When the drone crosses several zone boundaries in quick succession (e.g.
+// UK_BASE → CORRIDOR → TRANSIT in <2s at high speed), firing an event flash
+// for each transition floods the UI. We debounce: only fire if the zone has
+// been stable for ZONE_DEBOUNCE_MS.
+// ---------------------------------------------------------------------------
+const ZONE_DEBOUNCE_MS = 600;
+let   _pendingZone      = null;
+let   _zoneDebounceTimer = null;
+
+function _debounceZoneTransition(zone, allowed, reason) {
+  _pendingZone = { zone, allowed, reason };
+  clearTimeout(_zoneDebounceTimer);
+  _zoneDebounceTimer = setTimeout(() => {
+    if (_pendingZone) updateClearanceCard(_pendingZone.zone, _pendingZone.allowed, _pendingZone.reason);
+    _pendingZone = null;
+  }, ZONE_DEBOUNCE_MS);
+}
 
 function clsColour(cls) {
   if (cls === 'SECRET')    return '#f85149';   // red
@@ -502,9 +593,10 @@ function renderMap() {
     lastZone = pt.zone;
   }
 
-  const latest = [...trackPoints].reverse().find(p => p.allowed);
-  if (latest) {
-    const { x, y } = project(latest.lat, latest.lon);
+  // Draw drone icon at interpolated position (smooth 60fps lerp between ticks)
+  const dronePos = _interpolatedDronePos();
+  if (dronePos) {
+    const { x, y } = project(dronePos.lat, dronePos.lon);
     const glow = mctx.createRadialGradient(x, y, 2, x, y, 14);
     glow.addColorStop(0, 'rgba(255,255,255,0.3)');
     glow.addColorStop(1, 'rgba(255,255,255,0)');
@@ -727,6 +819,14 @@ async function backfillMission() {
     }
   }
   _backfilling = false;
+
+  // Seed the interpolation target from the last allowed backfill position so the
+  // drone icon appears immediately at the right place rather than jumping on first SSE frame.
+  const lastAllowed = [...trackPoints].reverse().find(p => p.allowed);
+  if (lastAllowed) {
+    _droneFrom = { lat: lastAllowed.lat, lon: lastAllowed.lon };
+    _droneTo   = { lat: lastAllowed.lat, lon: lastAllowed.lon };
+  }
 
   // Do NOT clear the video overlay here — the live SSE handler does that.
   // Backfill only covers historical track points; the drone's current zone is
@@ -1033,7 +1133,13 @@ async function start() {
 
   // SIG-003: SSE for per-frame notifications — drives map, telemetry log, and
   // redaction overlay. Video bytes come from SIG-010, not from here.
-  connectSSE(async (event) => {
+  //
+  // Frames are enqueued and processed one at a time (_enqueueSseFrame) to prevent
+  // concurrent async handlers from interleaving track points or overlay state.
+  connectSSE((event) => _enqueueSseFrame(_processSseFrame, event));
+}
+
+async function _processSseFrame(event) {
     const notification = JSON.parse(event.data);
 
     // Skip secondary FMV redaction events (fmv_redacted, fmv_allowed) — these
@@ -1051,9 +1157,7 @@ async function start() {
     const cls  = labels?.classification || labels?.cls || '?';
     const rels = labels?.releasability || [];
 
-    // Evaluate policy synchronously before any await — eliminates the race where
-    // a stale TRANSIT frame's hideVideoRedacted() fires after a SECRET frame's
-    // showVideoRedacted(), leaving Dave with an open feed he shouldn't see.
+    // Evaluate policy synchronously before any await — race-free overlay decision.
     const localAllowed = canAccessLocally(labels);
     if (localAllowed) {
       hideVideoRedacted();
@@ -1073,6 +1177,10 @@ async function start() {
       cntAllow++;
       if (lat != null && lon != null) {
         trackPoints.push({ lat, lon, zone, cls, allowed: true, ts: notification.ingest_ts });
+        // Start smooth interpolation to new position.
+        // Duration matches the frame interval so the drone arrives exactly as the next frame fires.
+        const intervalMs = (_demoInterval || 1.0) * 1000;
+        _updateDroneTarget(lat, lon, intervalMs);
       }
       updateVideoOverlay(enriched);
       addTelemEntry(enriched, true, null);
@@ -1084,13 +1192,16 @@ async function start() {
           trackPoints.push({ lat: last.lat, lon: last.lon, zone, cls, allowed: false, ts: notification.ingest_ts });
         }
       }
+      // When denied, stop interpolating — drone icon disappears until next allowed frame.
+      _droneTo = null;
       addTelemEntry(enriched, false, 'clearance_insufficient');
     }
 
-    updateStats(zone, localAllowed, null);
+    // Debounce zone transition events — only fire flash/clearance update if zone
+    // is stable for ZONE_DEBOUNCE_MS, preventing rapid-fire UI changes on quick crossings.
+    _debounceZoneTransition(zone, localAllowed, null);
     updateFooter(enriched);
     renderMap();
-  });
 }
 
 start();
