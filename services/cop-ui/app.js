@@ -70,12 +70,24 @@ const SIGNET_URL = params.get('signet') || '';
 // ---------------------------------------------------------------------------
 // Operator display profiles (policy enforced server-side by Signet OPA)
 // ---------------------------------------------------------------------------
+const CLS_RANK = { 'UNCLASS': 0, 'PROTECTED': 1, 'SECRET': 2, 'TOP SECRET': 3 };
+
 const OPERATORS = {
-  alice: { name: 'Alice', cls: 'SECRET',    rels: 'CAN · FVEY · GBR · USA · NATO · AUS · NZL' },
-  bob:   { name: 'Bob',   cls: 'SECRET',    rels: 'CAN' },
-  dave:  { name: 'Dave',  cls: 'PROTECTED', rels: 'CAN · FVEY' },
+  alice: { name: 'Alice', cls: 'SECRET',    rels: 'CAN · FVEY · GBR · USA · NATO · AUS · NZL', relsArr: ['CAN','FVEY','GBR','USA','NATO','AUS','NZL'] },
+  bob:   { name: 'Bob',   cls: 'SECRET',    rels: 'CAN',                                         relsArr: ['CAN'] },
+  dave:  { name: 'Dave',  cls: 'PROTECTED', rels: 'CAN · FVEY',                                  relsArr: ['CAN','FVEY'] },
 };
 const op = OPERATORS[USER] || OPERATORS['alice'];
+
+// Local policy check — mirrors Signet's OPA rules for clearance + releasability.
+// Used during backfill to avoid 200+ sequential unwrap() round-trips.
+function canAccessLocally(labels) {
+  const frameCls  = labels?.classification || 'UNCLASS';
+  const frameRels = labels?.releasability  || [];
+  if ((CLS_RANK[op.cls] ?? 0) < (CLS_RANK[frameCls] ?? 0)) return false;
+  if (frameRels.length === 0) return true;
+  return frameRels.some(r => op.relsArr.includes(r));
+}
 
 // ---------------------------------------------------------------------------
 // Zone config — must mirror mission.py
@@ -89,7 +101,9 @@ const ZONE_CFG = {
   UNKNOWN:           { colour: '#666',    label: '',           shape: null },
 };
 
-const CORRIDOR_BOX = { latMin: 51.24, latMax: 51.32, lonMin: -0.40, lonMax: 0.32 };
+// EXERCISE_CORRIDOR box — matches the actual 5km geofence circle (centre 51.275, -0.125).
+// Telemetry: corridor entry lon≈-0.183 (T+75s), exit lon≈-0.054 (T+105s), lat 51.271–51.280.
+const CORRIDOR_BOX = { latMin: 51.230, latMax: 51.320, lonMin: -0.190, lonMax: -0.040 };
 const MAP_BOUNDS   = { latMin: 51.18, latMax: 51.42, lonMin: -0.65, lonMax: 0.45 };
 
 // ---------------------------------------------------------------------------
@@ -274,6 +288,7 @@ function _drainQueue() {
 
 function feedSegment(arrayBuffer) {
   if (!_sourceBuffer) return;
+  if (!_videoAllowed) return;  // policy gate — don't buffer or play while redacted
   _segQueue.push(arrayBuffer);
   _drainQueue();
   if (videoEl.paused && videoEl.readyState >= 2) {
@@ -299,13 +314,23 @@ function updateVideoOverlay(meta) {
   badge.style.border     = `1px solid ${badge.style.color}`;
 }
 
+let _videoAllowed = false;  // gate: feedSegment will not play() unless true
+
 function showVideoRedacted(reason) {
-  // Stop feeding new segments — the existing buffer drains and the video
-  // naturally freezes on the last frame, then stalls. We accelerate that
-  // by pausing immediately and clearing the source so the screen goes black.
+  _videoAllowed = false;
   videoEl.pause();
-  // Drain the segment queue so buffered authorized frames don't leak through
-  _segQueue.length = 0;
+  _segQueue.length = 0;  // discard pending segments
+
+  // Flush the MSE SourceBuffer so decoded frames don't keep playing under the overlay
+  if (_sourceBuffer && !_sourceBuffer.updating && _mseReady) {
+    try {
+      if (_sourceBuffer.buffered.length > 0) {
+        const start = _sourceBuffer.buffered.start(0);
+        const end   = _sourceBuffer.buffered.end(_sourceBuffer.buffered.length - 1);
+        _sourceBuffer.remove(start, end + 0.1);
+      }
+    } catch {}
+  }
 
   document.getElementById('video-redacted').classList.add('visible');
   document.getElementById('redact-reason').textContent = reason || 'ACCESS DENIED';
@@ -316,6 +341,7 @@ function showVideoRedacted(reason) {
 }
 
 function hideVideoRedacted() {
+  _videoAllowed = true;
   document.getElementById('video-redacted').classList.remove('visible');
   // Resume playback — next feedSegment() call will restart it
   if (videoEl.paused && videoEl.readyState >= 2) {
@@ -375,13 +401,53 @@ function renderMap() {
     mctx.fillText((lon >= 0 ? '+' : '') + lon.toFixed(2) + '°', x + 3, H - 4);
   }
 
-  drawCorridorRect();
-  drawBaseRect('CAN_BASE');
-  drawBaseRect('UK_BASE');
-  drawZoneCircle('CAN_BASE');
-  drawZoneCircle('UK_BASE');
-  drawZoneCircle('TARGET_AREA');
-  drawMissionGhost();
+  if (op.cls === 'SECRET') {
+    // SECRET operators see full mission picture — planned route, all zone details.
+    drawCorridorRect();
+    drawBaseRect('CAN_BASE');
+    drawBaseRect('UK_BASE');
+    drawZoneCircle('CAN_BASE');
+    drawZoneCircle('UK_BASE');
+    drawZoneCircle('TARGET_AREA');
+    drawMissionGhost();
+  } else {
+    // PROTECTED operators (Dave): show dim outlines for all restricted zones —
+    // acknowledges controlled airspace exists but reveals no classification or detail.
+    // Draw each SECRET zone individually as a dim restricted outline.
+    // This way TRANSIT airspace between zones is visually clear — no false impression
+    // that authorized TRANSIT frames are inside restricted space.
+    const rFill   = 'rgba(80,80,80,0.06)';
+    const rStroke = 'rgba(150,150,150,0.3)';
+    const rText   = 'rgba(150,150,150,0.45)';
+    function _rCircle(lat, lon, radiusKm, label) {
+      const c = project(lat, lon);
+      const e = project(lat, lon + radiusKm / 111.32);
+      const r = e.x - c.x;
+      mctx.beginPath(); mctx.arc(c.x, c.y, r, 0, Math.PI * 2);
+      mctx.fillStyle = rFill; mctx.fill();
+      mctx.strokeStyle = rStroke; mctx.lineWidth = 1;
+      mctx.setLineDash([4, 6]); mctx.stroke(); mctx.setLineDash([]);
+      mctx.fillStyle = rText; mctx.font = '9px Courier New';
+      mctx.textAlign = 'center';
+      mctx.fillText(label, c.x, c.y - r - 4);
+      mctx.textAlign = 'left';
+    }
+    function _rRect(latMin, latMax, lonMin, lonMax, label) {
+      const tl = project(latMax, lonMin), br = project(latMin, lonMax);
+      const w = br.x - tl.x, h = br.y - tl.y;
+      mctx.fillStyle = rFill; mctx.fillRect(tl.x, tl.y, w, h);
+      mctx.strokeStyle = rStroke; mctx.lineWidth = 1;
+      mctx.setLineDash([4, 6]); mctx.strokeRect(tl.x, tl.y, w, h); mctx.setLineDash([]);
+      mctx.fillStyle = rText; mctx.font = '9px Courier New';
+      mctx.fillText(label, tl.x + 6, tl.y + 14);
+    }
+    // UK_BASE: SECRET/GBR,FVEY — Dave cannot access
+    _rCircle(51.2700, -0.2000, 1.0, 'RESTRICTED');
+    // EXERCISE_CORRIDOR: SECRET/FVEY — Dave cannot access
+    _rRect(CORRIDOR_BOX.latMin, CORRIDOR_BOX.latMax, CORRIDOR_BOX.lonMin, CORRIDOR_BOX.lonMax, 'RESTRICTED AIRSPACE');
+    // TARGET_AREA: SECRET/FVEY — Dave cannot access
+    _rCircle(51.3000,  0.2500, 2.0, 'RESTRICTED');
+  }
 
   // Draw track lines — classification-colored for allowed, dashed red for denied
   for (let i = 1; i < trackPoints.length; i++) {
@@ -614,8 +680,10 @@ async function backfillMission() {
   const elapsedS = statusRes.mission_elapsed_s ?? 0;
   if (elapsedS < 2) return; // mission just started, nothing to backfill
 
-  // since = now - elapsed (ms), with a small buffer
-  const sinceMs = Math.floor(Date.now() - elapsedS * 1000 - 2000);
+  // Compute the wall-clock timestamp when this mission run started.
+  // No fuzz buffer — we want exactly this run's frames, not any tail of the previous run.
+  const missionStartMs = Math.floor(Date.now() - elapsedS * 1000);
+  const sinceMs = missionStartMs;
 
   // Fetch all objects from this mission window (up to 500 frames = well above mission length)
   let items;
@@ -628,6 +696,11 @@ async function backfillMission() {
 
   if (items.length === 0) return;
 
+  // Filter strictly to this run: both mission_id match AND ingested after mission start.
+  // Same mission_id is reused across runs so ingest_ts is the authoritative boundary.
+  items = items.filter(i => i.metadata?.mission_id === MISSION_ID && i.ingest_ts >= missionStartMs);
+  if (items.length === 0) return;
+
   // Sort oldest-first by ingest_ts (API returns newest-first)
   items.sort((a, b) => a.ingest_ts - b.ingest_ts);
 
@@ -637,24 +710,28 @@ async function backfillMission() {
     if (!meta?.lat || !meta?.lon) continue;
     seenIds.add(item.object_id);
 
-    const result = await unwrap(item.object_id);
-    const cls    = item.labels?.classification || item.labels?.cls || '?';
-    const zone   = meta.zone || 'UNKNOWN';
+    // Use local policy check instead of unwrap() to avoid N sequential HTTP round-trips.
+    // The live SSE path still calls unwrap() for authoritative enforcement.
+    const allowed = canAccessLocally(item.labels);
+    const cls     = item.labels?.classification || item.labels?.cls || '?';
+    const zone    = meta.zone || 'UNKNOWN';
 
-    if (result.allowed) {
+    if (allowed) {
       trackPoints.push({ lat: meta.lat, lon: meta.lon, zone, cls, allowed: true, ts: item.ingest_ts });
-    } else if (trackPoints.length > 0) {
+    } else if (op.cls === 'SECRET' && trackPoints.length > 0) {
+      // SECRET operators (Alice, Bob) see a dashed denied segment — they know the drone
+      // exists but can't decrypt. PROTECTED operators (Dave) get no point at all:
+      // they have no positional awareness of SECRET frames.
       const last = trackPoints[trackPoints.length - 1];
       trackPoints.push({ lat: last.lat, lon: last.lon, zone, cls, allowed: false, ts: item.ingest_ts });
     }
   }
   _backfilling = false;
 
-  // If the most recent frame was denied, show the redaction overlay immediately
-  // so Dave doesn't see an unredacted video panel while waiting for the next SSE event.
-  if (trackPoints.length > 0 && !trackPoints[trackPoints.length - 1].allowed) {
-    showVideoRedacted('ACCESS DENIED — CLEARANCE INSUFFICIENT');
-  }
+  // Do NOT clear the video overlay here — the live SSE handler does that.
+  // Backfill only covers historical track points; the drone's current zone is
+  // determined by the first live SSE frame, which arrives within ~1s of connecting.
+  // Clearing the overlay here risks showing video in a gap between backfill and SSE.
 
   renderMap();
 }
@@ -974,39 +1051,43 @@ async function start() {
     const cls  = labels?.classification || labels?.cls || '?';
     const rels = labels?.releasability || [];
 
+    // Evaluate policy synchronously before any await — eliminates the race where
+    // a stale TRANSIT frame's hideVideoRedacted() fires after a SECRET frame's
+    // showVideoRedacted(), leaving Dave with an open feed he shouldn't see.
+    const localAllowed = canAccessLocally(labels);
+    if (localAllowed) {
+      hideVideoRedacted();
+    } else {
+      showVideoRedacted('ACCESS DENIED — CLEARANCE INSUFFICIENT');
+    }
+
     // SSE event includes metadata inline — use it directly; no extra round-trip needed.
     const meta = notification.metadata || await fetchObjectMeta(object_id, ingest_ts);
     const zone = meta?.zone || 'UNKNOWN';
     const lat  = meta?.lat;
     const lon  = meta?.lon;
 
-    // SIG-002: metadata unwrap — policy check (determines overlay state)
-    const result = await unwrap(object_id);
-
     const enriched = { ...notification, zone, lat, lon, classification: cls, releasability: rels, metadata: meta };
 
-    if (result.allowed) {
+    if (localAllowed) {
       cntAllow++;
       if (lat != null && lon != null) {
         trackPoints.push({ lat, lon, zone, cls, allowed: true, ts: notification.ingest_ts });
       }
-      hideVideoRedacted();
       updateVideoOverlay(enriched);
       addTelemEntry(enriched, true, null);
     } else {
       cntDeny++;
-      if (trackPoints.length > 0) {
+      if (op.cls === 'SECRET' && trackPoints.length > 0) {
         const last = trackPoints[trackPoints.length - 1];
-        // Carry last known position so denied segment is still drawn
         if (last.lat != null && last.lon != null) {
           trackPoints.push({ lat: last.lat, lon: last.lon, zone, cls, allowed: false, ts: notification.ingest_ts });
         }
       }
-      showVideoRedacted(result.reason);
-      addTelemEntry(enriched, false, result.reason);
+      addTelemEntry(enriched, false, 'clearance_insufficient');
     }
 
-    updateStats(zone, result.allowed, result.reason);
+    updateStats(zone, localAllowed, null);
     updateFooter(enriched);
     renderMap();
   });
